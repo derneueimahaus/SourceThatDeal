@@ -78,6 +78,56 @@ class OutlookClient:
             self._namespace = None
             return False
 
+    # ------------------------------------------------------------------
+    # Draft creation
+    # ------------------------------------------------------------------
+
+    def _save_draft_oom(
+        self,
+        to: str,
+        subject: str,
+        html_body: str,
+        *,
+        cc: Optional[str] = None,
+        bcc: Optional[str] = None,
+        deferred_delivery: Optional[datetime] = None,
+    ) -> bool:
+        """Save an Outlook draft via OOM only (no MAPI, no OMG).
+
+        Pure OOM approach: Create MailItem, set Subject/HTMLBody, set To/CC/BCC
+        as display strings, set DeferredDeliveryTime if needed, then Save.
+
+        Setting mail.To/CC/BCC to strings does NOT trigger OMG—only actual
+        Sending or reading addresses from existing items does. This is safe
+        for new drafts.
+        """
+        if not self._ensure_outlook():
+            return False
+
+        try:
+            mail = self._outlook.CreateItem(0)  # 0 = olMailItem
+            mail.Subject = subject
+            mail.HTMLBody = html_body
+
+            # Set recipients as display strings (no address-book resolution, no OMG)
+            if to:
+                mail.To = to
+            if cc:
+                mail.CC = cc
+            if bcc:
+                mail.BCC = bcc
+
+            if deferred_delivery is not None:
+                mail.DeferredDeliveryTime = pywintypes.Time(deferred_delivery.timestamp())
+
+            mail.Save()
+            mail.Close(1)  # olDiscard (already saved)
+            return True
+
+        except Exception as e:
+            logger.exception("Failed to save draft: %s", e)
+            return False
+
     def create_draft(
         self,
         to: str,
@@ -120,32 +170,12 @@ class OutlookClient:
         bcc: Optional[str] = None,
         html_body: Optional[str] = None,
     ) -> bool:
-        if not self._ensure_outlook():
-            return False
-        try:
-            mail = self._outlook.CreateItem(0)  # 0 = olMail
-            mail.To = to
-            mail.Subject = subject
-            if cc:
-                mail.CC = cc
-            if bcc:
-                mail.BCC = bcc
-
-            # Access the inspector to ensure the mail item is fully initialized.
-            # This is a robust way to prepare the item before modifying its body.
-            _ = mail.GetInspector
-
-            if html_body is not None:
-                # Overwrite the entire body (including any default signature) with our HTML.
-                mail.HTMLBody = html_body
-            else:
-                mail.Body = body
-
-            mail.Save()
-            return True
-        except Exception as e:
-            logger.exception("Failed to create draft: %s", e)
-            return False
+        # Route through signature path so all drafts include signature
+        return self._create_draft_with_sig_real(
+            to, subject,
+            html_body if html_body is not None else body,
+            cc=cc, bcc=bcc,
+        )
 
     def _create_draft_mock(
         self,
@@ -168,6 +198,10 @@ class OutlookClient:
         )
         return True
 
+    # ------------------------------------------------------------------
+    # Signature extraction
+    # ------------------------------------------------------------------
+
     def get_default_signature_html(self) -> str:
         """
         Extract the default Outlook signature HTML by creating a throwaway mail item.
@@ -178,17 +212,56 @@ class OutlookClient:
         return ""
 
     def _get_signature_real(self) -> str:
-        if not self._ensure_outlook():
-            return ""
+        """Read default Outlook signature HTML from disk. No COM, no OMG.
+
+        Avoids GetInspector which triggers internal CurrentUser.Address resolution.
+        Instead reads .htm file from %%APPDATA%%\\Microsoft\\Signatures\\
+        """
         try:
-            mail = self._outlook.CreateItem(0)
-            _ = mail.GetInspector  # triggers Outlook to insert default signature
-            sig = mail.HTMLBody or ""
-            mail.Close(1)  # 1 = olDiscard
-            return sig
-        except Exception as e:
-            logger.exception("Could not extract signature: %s", e)
+            import os
+            import winreg
+
+            sig_dir = os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Signatures")
+            if not os.path.isdir(sig_dir):
+                return ""
+
+            # Try registry first to find configured default signature name
+            sig_name = None
+            for ver in ["16.0", "15.0", "14.0", "12.0"]:
+                try:
+                    reg_path = f"Software\\Microsoft\\Office\\{ver}\\Common\\MailSettings"
+                    with winreg.OpenKey(
+                        winreg.HKEY_CURRENT_USER,
+                        reg_path,
+                    ) as key:
+                        val, _ = winreg.QueryValueEx(key, "NewSignature")
+                        if val:
+                            sig_name = val
+                            break
+                except OSError:
+                    continue
+
+            if sig_name:
+                sig_file = os.path.join(sig_dir, f"{sig_name}.htm")
+                if os.path.exists(sig_file):
+                    with open(sig_file, "r", encoding="utf-8", errors="ignore") as f:
+                        return f.read()
+
+            # Fallback: use the only .htm file if exactly one exists
+            htm_files = [f for f in os.listdir(sig_dir) if f.lower().endswith(".htm")]
+            if len(htm_files) == 1:
+                with open(os.path.join(sig_dir, htm_files[0]), "r",
+                          encoding="utf-8", errors="ignore") as f:
+                    return f.read()
+
             return ""
+        except Exception as e:
+            logger.warning("Could not read signature from filesystem: %s", e)
+            return ""
+
+    # ------------------------------------------------------------------
+    # Draft with signature + optional deferred delivery
+    # ------------------------------------------------------------------
 
     def create_draft_with_signature(
         self,
@@ -235,14 +308,8 @@ class OutlookClient:
         if not self._ensure_outlook():
             return False
         try:
-            mail = self._outlook.CreateItem(0)
-
-            # Get signature: use cached version or extract from this mail item
-            if signature_html:
-                sig = signature_html
-            else:
-                _ = mail.GetInspector
-                sig = mail.HTMLBody or ""
+            # Get signature: use cached version or extract fresh
+            sig = signature_html if signature_html else self._get_signature_real()
 
             # Merge template HTML with signature
             # Insert our content right after <body...> tag in the signature HTML
@@ -256,18 +323,11 @@ class OutlookClient:
             else:
                 final_html = html_body
 
-            mail.HTMLBody = final_html
-            mail.To = to
-            mail.Subject = subject
-            if cc:
-                mail.CC = cc
-            if bcc:
-                mail.BCC = bcc
-            if deferred_delivery:
-                mail.DeferredDeliveryTime = deferred_delivery
-
-            mail.Save()
-            return True
+            return self._save_draft_oom(
+                to, subject, final_html,
+                cc=cc, bcc=bcc,
+                deferred_delivery=deferred_delivery,
+            )
         except Exception as e:
             logger.exception("Failed to create draft with signature: %s", e)
             return False
@@ -282,6 +342,10 @@ class OutlookClient:
             to, subject, len(html_body), cc, bcc, deferred_delivery,
         )
         return True
+
+    # ------------------------------------------------------------------
+    # Reply scanning
+    # ------------------------------------------------------------------
 
     def scan_for_replies(
         self,
@@ -299,8 +363,8 @@ class OutlookClient:
             max_items: Maximum number of items to scan (default 500).
 
         Returns:
-            List of dicts with keys: sender_email, subject, received_time, entry_id (or similar).
-            Empty list on error or when using mock and no mock data is configured.
+            List of dicts with keys: sender_email, subject, received_time, entry_id.
+            Empty list on error or when using mock backend.
         """
         if not email_list:
             return []
@@ -315,52 +379,12 @@ class OutlookClient:
         folder_name: str,
         max_items: int,
     ) -> list[dict]:
-        if not self._ensure_outlook():
-            return []
-        try:
-            inbox = self._namespace.GetDefaultFolder(6)  # 6 = olFolderInbox
-            if folder_name != "Inbox":
-                folders = inbox.Parent.Folders
-                folder = None
-                for i in range(1, folders.Count + 1):
-                    if folders.Item(i).Name == folder_name:
-                        folder = folders.Item(i)
-                        break
-                if folder is None:
-                    folder = inbox
-            else:
-                folder = inbox
-            items = folder.Items
-            items.Sort("[ReceivedTime]", True)  # descending
-            results = []
-            count = 0
-            for item in items:
-                if count >= max_items:
-                    break
-                try:
-                    sender = getattr(item, "SenderEmailAddress", None) or getattr(
-                        item, "Sender", None
-                    )
-                    if sender is None:
-                        continue
-                    sender_str = str(sender).strip().lower()
-                    if sender_str not in email_set:
-                        continue
-                    received = getattr(item, "ReceivedTime", None)
-                    results.append({
-                        "sender_email": sender_str,
-                        "subject": getattr(item, "Subject", "") or "",
-                        "received_time": received,
-                        "entry_id": getattr(item, "EntryID", "") or "",
-                    })
-                    count += 1
-                except Exception as e:
-                    logger.debug("Skipping item during scan: %s", e)
-                    continue
-            return results
-        except Exception as e:
-            logger.exception("Failed to scan for replies: %s", e)
-            return []
+        """Scan for replies is disabled; returns empty list.
+
+        This feature will be re-implemented later.
+        """
+        logger.info("scan_for_replies is disabled; returning empty list.")
+        return []
 
     def _scan_for_replies_mock(
         self,
