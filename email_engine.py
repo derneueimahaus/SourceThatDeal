@@ -51,13 +51,29 @@ class OutlookClient:
         try:
             if self._outlook is None:
                 try:
-                    self._outlook = _win32com.client.GetActiveObject("Outlook.Application")
-                except Exception:
-                    self._outlook = _win32com.client.Dispatch("Outlook.Application")
+                    self._outlook = _win32com.GetActiveObject("Outlook.Application")
+                except pywintypes.com_error:
+                    logger.info(
+                        "Outlook.Application not active, attempting to dispatch new instance."
+                    )
+                    self._outlook = _win32com.Dispatch("Outlook.Application")
+                except Exception as e:
+                    logger.warning(
+                        "Failed to get active Outlook object: %s. Attempting to dispatch.",
+                        e,
+                    )
+                    self._outlook = _win32com.Dispatch("Outlook.Application")
                 self._namespace = self._outlook.GetNamespace("MAPI")
             return True
+        except pywintypes.com_error as e:
+            logger.exception(
+                "Outlook COM error: %s. Please ensure Outlook is running and responsive.", e
+            )
+            self._outlook = None
+            self._namespace = None
+            return False
         except Exception as e:
-            logger.warning("Outlook not available: %s", e)
+            logger.exception("Failed to connect to Outlook: %s", e)
             self._outlook = None
             self._namespace = None
             return False
@@ -110,15 +126,21 @@ class OutlookClient:
             mail = self._outlook.CreateItem(0)  # 0 = olMail
             mail.To = to
             mail.Subject = subject
-            if html_body and html_body.strip():
-                mail.HTMLBody = html_body.strip()
-                mail.Body = body  # fallback plain text
-            else:
-                mail.Body = body
             if cc:
                 mail.CC = cc
             if bcc:
                 mail.BCC = bcc
+
+            # Access the inspector to ensure the mail item is fully initialized.
+            # This is a robust way to prepare the item before modifying its body.
+            _ = mail.GetInspector
+
+            if html_body is not None:
+                # Overwrite the entire body (including any default signature) with our HTML.
+                mail.HTMLBody = html_body
+            else:
+                mail.Body = body
+
             mail.Save()
             return True
         except Exception as e:
@@ -165,7 +187,7 @@ class OutlookClient:
             mail.Close(1)  # 1 = olDiscard
             return sig
         except Exception as e:
-            logger.debug("Could not extract signature: %s", e)
+            logger.exception("Could not extract signature: %s", e)
             return ""
 
     def create_draft_with_signature(

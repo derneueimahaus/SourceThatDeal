@@ -62,5 +62,15 @@ export default {
       editor.focus();
       editor.runCmd('insertHTML', text);
     },
+    setFontName(name) {
+      const editor = this.$refs.qRef;
+      editor.focus();
+      editor.runCmd('fontName', name);
+    },
+    setFontSize(size) {
+      const editor = this.$refs.qRef;
+      editor.focus();
+      editor.runCmd('fontSize', size);
+    },
   },
 };

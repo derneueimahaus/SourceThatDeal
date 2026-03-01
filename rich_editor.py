@@ -24,9 +24,11 @@ class RichEditor(ValueElement, DisableableElement, component="rich_editor.js", d
         placeholder: str | None = DEFAULT_PROP | None,
         value: str = DEFAULT_PROP | "",
         on_change: Handler[ValueChangeEventArguments] | None = None,
+        toolbar: list[list[str]] | None = None,
     ) -> None:
         super().__init__(value=value, on_value_change=on_change)
         self._props.set_optional("placeholder", placeholder)
+        self._props.set_optional("toolbar", toolbar)
 
     def _handle_value_change(self, value: Any) -> None:
         super()._handle_value_change(value)
@@ -36,3 +38,11 @@ class RichEditor(ValueElement, DisableableElement, component="rich_editor.js", d
     def insert_at_cursor(self, text: str) -> None:
         """Insert text (e.g. a placeholder like '{{First Name}}') at the current cursor position."""
         self.run_method("insertAtCursor", text)
+
+    def set_font_name(self, name: str) -> None:
+        """Apply a font family to the selected text."""
+        self.run_method("setFontName", name)
+
+    def set_font_size(self, size: int) -> None:
+        """Apply a font size (1-7) to the selected text."""
+        self.run_method("setFontSize", size)

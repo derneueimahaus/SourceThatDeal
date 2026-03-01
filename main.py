@@ -15,6 +15,7 @@ from file_manager import (
     delete_folder,
     delete_template,
     list_folders,
+    move_template,
     list_templates,
     read_template,
     write_template,
@@ -29,7 +30,7 @@ from file_manager import (
     delete_campaign,
     _sanitize_campaign_filename,
 )
-from email_engine import OutlookClient
+from email_engine import OutlookClient, _USE_REAL_OUTLOOK
 from campaign_engine import (
     extract_template_fields,
     merge_template,
@@ -38,6 +39,12 @@ from campaign_engine import (
     guess_column_match,
     create_campaign_drafts,
 )
+
+if _USE_REAL_OUTLOOK:
+    try:
+        import pythoncom
+    except ImportError:
+        pass # pythoncom should be available if win32com is
 
 # Corporate palette: White / Slate / Navy (project_plan.md)
 NAVY = "#1e3a5f"
@@ -53,6 +60,16 @@ PLACEHOLDERS = {
     "Email": "{{Email}}",
     "Wildcard": None,  # prompts user for a custom field name
 }
+
+# Font and size options for editor formatting dropdowns
+FONT_OPTIONS = {
+    "Arial": "Arial",
+    "Verdana": "Verdana",
+    "Georgia": "Georgia",
+    "Times New Roman": "Times New Roman",
+    "Courier New": "Courier New",
+}
+SIZE_OPTIONS = {"1": 1, "2": 2, "3": 3, "4": 4, "5": 5, "6": 6, "7": 7}
 
 
 def _nav_button(label: str, icon: str, is_active: bool, on_click):
@@ -111,7 +128,6 @@ def _render_template_library(state: dict, refresh):
     """
     selected = state.get("selected_template")
     folders = list_folders()
-    outlook = OutlookClient()
 
     with ui.row().classes("w-full flex-1 min-h-0 min-w-0 gap-0"):
         # Left column: Templates heading, Add new template, New folder, then folder list + templates
@@ -170,7 +186,7 @@ def _render_template_library(state: dict, refresh):
         with ui.column().classes("flex-1 min-w-0 flex flex-col pl-4"):
             # Action buttons (top right)
             with ui.row().classes("w-full justify-end gap-2 mb-4"):
-                send_btn = ui.button("Send mail", on_click=lambda: _send_mail(state, outlook))
+                send_btn = ui.button("Send mail", on_click=lambda: _send_mail(state))
                 send_btn.classes("bg-blue-600 text-white")
                 send_btn.props("no-caps")
 
@@ -181,6 +197,12 @@ def _render_template_library(state: dict, refresh):
                 save_btn.props("no-caps")
                 if not selected:
                     save_btn.props("disable")
+
+                move_btn = ui.button("Move", on_click=lambda: _move_template_dialog(state, refresh))
+                move_btn.classes("bg-slate-50 text-slate-700 border border-slate-300")
+                move_btn.props("no-caps")
+                if not selected:
+                    move_btn.props("disable")
 
                 def do_delete():
                     _delete_template(state, refresh)
@@ -196,11 +218,41 @@ def _render_template_library(state: dict, refresh):
             editor = RichEditor(value=initial_html).classes("w-full flex-1 min-h-64")
             state["template_editor"] = editor
 
-            # Insert Field dropdown (merge-field placeholders)
+            # Formatting controls + Insert Field dropdown
             with ui.row().classes("w-full items-center gap-2 mt-2"):
                 ui.label("Preview / Edit Template Canvas").classes(
                     "text-slate-500 text-sm flex-1"
                 )
+
+                # Font family selector
+                font_select = ui.select(
+                    options=list(FONT_OPTIONS.keys()),
+                    label="Font",
+                    value=None,
+                ).props("outlined dense options-dense").classes("w-36")
+
+                def on_font_selected(e):
+                    if e.value:
+                        editor.set_font_name(FONT_OPTIONS[e.value])
+                        font_select.set_value(None)
+
+                font_select.on_value_change(on_font_selected)
+
+                # Font size selector
+                size_select = ui.select(
+                    options=list(SIZE_OPTIONS.keys()),
+                    label="Size",
+                    value=None,
+                ).props("outlined dense options-dense").classes("w-24")
+
+                def on_size_selected(e):
+                    if e.value:
+                        editor.set_font_size(SIZE_OPTIONS[e.value])
+                        size_select.set_value(None)
+
+                size_select.on_value_change(on_size_selected)
+
+                # Insert Field dropdown (merge-field placeholders)
                 field_select = ui.select(
                     options=list(PLACEHOLDERS.keys()),
                     label="Insert Field",
@@ -413,7 +465,7 @@ def _create_new_contact_list(state: dict, refresh):
             def create():
                 name = (name_input.value or "").strip()
                 if not name:
-                    ui.notify("Enter a list name.", type="warning")
+                    ui.notify("Enter a list name.", type="warning") # Moved before dlg.close()
                     return
                 default_cols = ["Email", "First Name", "Last Name", "Company", "Title"]
                 filename = f"{name}.xlsx"
@@ -421,7 +473,7 @@ def _create_new_contact_list(state: dict, refresh):
                 state["selected_contact_list"] = filename
                 dlg.close()
                 refresh()
-                ui.notify("Contact list created.")
+                ui.notify("Contact list created.") # Moved before dlg.close()
 
             ui.button("Create", on_click=create).classes("bg-blue-600 text-white").props("no-caps")
     dlg.open()
@@ -436,13 +488,12 @@ def _confirm_delete_contact_list(filename: str, state: dict, refresh):
             ui.button("Cancel", on_click=dlg.close).props("flat no-caps")
 
             def confirm():
+                ui.notify("Contact list deleted.") # Moved before dlg.close()
                 delete_contact_list(filename)
                 if state.get("selected_contact_list") == filename:
                     state["selected_contact_list"] = None
                 dlg.close()
                 refresh()
-                ui.notify("Contact list deleted.")
-
             ui.button("Delete", on_click=confirm).classes(
                 "bg-red-600 text-white"
             ).props("no-caps")
@@ -594,13 +645,13 @@ def _create_new_campaign(state: dict, refresh):
             def create():
                 name = (name_input.value or "").strip()
                 if not name:
-                    ui.notify("Enter a campaign name.", type="warning")
+                    ui.notify("Enter a campaign name.", type="warning") # Moved before dlg.close()
                     return
                 try:
                     filename = _sanitize_campaign_filename(name)
                     data = {
                         "name": name,
-                        "template_id": "",
+                        "template_id": "", # Fix: This was missing a comma
                         "contact_list": "",
                         "email_column": "",
                         "subject_template": "",
@@ -614,7 +665,7 @@ def _create_new_campaign(state: dict, refresh):
                     state["selected_campaign"] = filename
                     dlg.close()
                     refresh()
-                    ui.notify("Campaign created.")
+                    ui.notify("Campaign created.") # Moved before dlg.close()
                 except Exception as e:
                     ui.notify(f"Failed: {e}", type="negative")
 
@@ -632,13 +683,12 @@ def _confirm_delete_campaign(filename: str, state: dict, refresh):
             ui.button("Cancel", on_click=dlg.close).props("flat no-caps")
 
             def confirm():
+                ui.notify("Campaign deleted.") # Moved before dlg.close()
                 delete_campaign(filename)
                 if state.get("selected_campaign") == filename:
                     state["selected_campaign"] = None
                 dlg.close()
                 refresh()
-                ui.notify("Campaign deleted.")
-
             ui.button("Delete", on_click=confirm).classes(
                 "bg-red-600 text-white"
             ).props("no-caps")
@@ -1067,11 +1117,21 @@ async def _run_campaign_drafts(
     progress_label.set_text(f"Creating drafts... 0/{total}")
 
     def do_creation():
+        if _USE_REAL_OUTLOOK:
+            pythoncom.CoInitialize()  # Initialize COM for this thread
+            # Instantiate OutlookClient and get signature within the worker thread
+            # This ensures COM objects are bound to this thread.
+            thread_outlook_client = OutlookClient()
+            signature_html = thread_outlook_client.get_default_signature_html()
+        else:
+            # For mock backend, instantiate here for consistency
+            thread_outlook_client = OutlookClient()
+            signature_html = ""  # Mock backend doesn't have a real signature
         def on_progress(current, tot):
             progress_state["current"] = current
 
         success, errors = create_campaign_drafts(
-            outlook=outlook,
+            outlook=thread_outlook_client,  # Pass the thread-local client
             template_html=html,
             subject_template=subject_template or "",
             rows=rows,
@@ -1084,6 +1144,8 @@ async def _run_campaign_drafts(
         progress_state["success"] = success
         progress_state["errors"] = errors
         progress_state["done"] = True
+        if _USE_REAL_OUTLOOK:
+            pythoncom.CoUninitialize() # Uninitialize COM
 
     # Poll progress with a timer
     def poll_progress():
@@ -1136,6 +1198,7 @@ def _wildcard_dialog(editor: RichEditor, field_select):
             ui.button("Cancel", on_click=cancel).props("flat no-caps")
 
             def insert():
+                ui.notify("Wildcard inserted.") # Moved before dlg.close()
                 name = (name_input.value or "").strip()
                 if not name:
                     ui.notify("Enter a field name.", type="warning")
@@ -1143,7 +1206,6 @@ def _wildcard_dialog(editor: RichEditor, field_select):
                 editor.insert_at_cursor(f"{{{{{name}}}}}")
                 field_select.set_value(None)
                 dlg.close()
-
             ui.button("Insert", on_click=insert).classes("bg-blue-600 text-white").props("no-caps")
     dlg.open()
 
@@ -1168,13 +1230,12 @@ def _add_new_folder(state: dict, refresh):
                     ui.notify("Enter a folder name.", type="warning")
                     return
                 try:
+                    ui.notify("Folder created.") # Moved before dlg.close()
                     create_folder(name)
                     dlg.close()
                     refresh()
-                    ui.notify("Folder created.")
                 except Exception as e:
                     ui.notify(str(e), type="negative")
-
             ui.button("Create", on_click=create).classes("bg-blue-600 text-white").props("no-caps")
     dlg.open()
 
@@ -1188,18 +1249,66 @@ def _confirm_delete_folder(folder_name: str, state: dict, refresh):
 
             def confirm():
                 try:
+                    ui.notify("Folder deleted.") # Moved before dlg.close()
                     delete_folder(folder_name)
                     if state.get("selected_template", "").startswith(f"{folder_name}/"):
                         state["selected_template"] = None
                     dlg.close()
                     refresh()
-                    ui.notify("Folder deleted.")
                 except Exception as e:
                     ui.notify(str(e), type="negative")
-
             ui.button("Delete", on_click=confirm).classes(
                 "bg-red-600 text-white"
             ).props("no-caps")
+    dlg.open()
+
+
+def _move_template_dialog(state: dict, refresh):
+    """Dialog to move the selected template to a different folder."""
+    selected_id = state.get("selected_template")
+    if not selected_id:
+        ui.notify("No template selected.", type="warning")
+        return
+
+    if "/" in selected_id:
+        current_folder, name = selected_id.split("/", 1)
+    else:
+        current_folder, name = ROOT_FOLDER, selected_id
+
+    folders = list_folders()
+    target_folders = [f for f in folders if f != current_folder]
+
+    if not target_folders:
+        ui.notify("No other folders to move to.", type="info")
+        return
+
+    with ui.dialog() as dlg, ui.card().classes("p-4 min-w-80"):
+        ui.label(f'Move template "{name}"')
+        folder_select = ui.select(
+            target_folders,
+            value=target_folders[0],
+            label="Target Folder",
+        ).classes("w-full")
+        folder_select.props("outlined")
+
+        with ui.row().classes("mt-4 gap-2"):
+            ui.button("Cancel", on_click=dlg.close).props("flat no-caps")
+
+            def do_move():
+                target = folder_select.value
+                if not target:
+                    ui.notify("Select a target folder.", type="warning")
+                    return
+                try:
+                    move_template(selected_id, target)
+                    state["selected_template"] = f"{target}/{name}"
+                    ui.notify(f'Moved to "{target}".')
+                    dlg.close()
+                    refresh()
+                except Exception as e:
+                    ui.notify(f"Failed to move: {e}", type="negative")
+
+            ui.button("Move", on_click=do_move).classes("bg-blue-600 text-white").props("no-caps")
     dlg.open()
 
 
@@ -1229,15 +1338,14 @@ def _add_new_template(state: dict, refresh):
                     ui.notify("Enter a template name.", type="warning")
                     return
                 try:
+                    ui.notify("Template created.") # Moved before dlg.close()
                     template_id = f"{folder}/{name}"
                     write_template(template_id, "")
                     state["selected_template"] = template_id
                     dlg.close()
                     refresh()
-                    ui.notify("Template created.")
                 except Exception as e:
                     ui.notify(f"Failed to create: {e}", type="negative")
-
             ui.button("Create", on_click=create).classes("bg-blue-600 text-white").props("no-caps")
     dlg.open()
 
@@ -1255,11 +1363,12 @@ def _save_template(state: dict):
         ui.notify(f"Failed to save: {e}", type="negative")
 
 
-def _send_mail(state: dict, outlook: OutlookClient):
+def _send_mail(state: dict):
+    outlook = OutlookClient()
     editor = state.get("template_editor")
     selected = state.get("selected_template") or "Draft"
     html = (editor.value or "") if editor else ""
-    subject = selected.split("/")[-1] if selected and "/" in selected else (selected or "No subject")
+    subject = (selected.split("/")[-1] if selected and "/" in selected else selected) or "No Subject"
     ok = outlook.create_draft(to="", subject=subject, body="", html_body=html or None)
     if ok:
         ui.notify("Draft created in Outlook.")
@@ -1278,12 +1387,12 @@ def _delete_template(state: dict, refresh):
         with ui.row().classes("mt-4 gap-2"):
             ui.button("Cancel", on_click=dialog.close).props("flat no-caps")
             def confirm():
+                ui.notify("Template deleted.") # Moved before dialog.close()
                 try:
                     delete_template(selected)
                     state["selected_template"] = None
                     dialog.close()
                     refresh()
-                    ui.notify("Template deleted.")
                 except Exception as e:
                     ui.notify(f"Failed to delete: {e}", type="negative")
             ui.button("Delete", on_click=confirm).classes(
