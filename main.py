@@ -3,6 +3,15 @@ SourceThatDeal — PE Deal Sourcing Automator
 Entry point and main layout: sidebar navigation + content area.
 """
 
+import sys
+import os
+
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w")
+
+
 from nicegui import ui
 
 import asyncio
@@ -1476,8 +1485,10 @@ def index():
 
 
 if __name__ in {"__main__", "__mp_main__"}:
+    import multiprocessing
+    multiprocessing.freeze_support()
     ui.run(
         title="SourceThatDeal",
         favicon="✉️",
-        reload=True,
+        reload=False,
     )

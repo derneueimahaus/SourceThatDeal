@@ -7,11 +7,18 @@ CRUD for campaigns (JSON in /data/campaigns).
 
 import json
 from pathlib import Path
+import sys
 
 import openpyxl
 
-TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
-DATA_DIR = Path(__file__).resolve().parent / "data"
+if getattr(sys, 'frozen', False):
+    _BASE = Path(sys._MEIPASS)
+else:
+    _BASE = Path(__file__).resolve().parent
+
+
+TEMPLATES_DIR = _BASE / "templates"
+DATA_DIR = _BASE / "data"
 ROOT_FOLDER = "General"  # Templates in templates/*.html live in this logical folder
 
 
