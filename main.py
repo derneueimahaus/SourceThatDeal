@@ -299,13 +299,17 @@ def _render_contact_lists(state: dict, refresh):
             )
 
             # Import button
-            def handle_upload(e):
-                for file in e.files if hasattr(e, 'files') else [e]:
-                    name = getattr(file, 'name', 'upload.xlsx')
-                    content = file.content if hasattr(file, 'content') else file.read()
+            async def handle_upload(e):
+                try:
+                    name = e.file.name
+                    content = await e.file.read()
                     import_contact_list(content, name)
-                ui.notify("List imported.")
-                refresh()
+                    last_name = name if name.lower().endswith('.xlsx') else f"{name}.xlsx"
+                    state["selected_contact_list"] = last_name
+                    ui.notify("List imported.")
+                    refresh()
+                except Exception as exc:
+                    ui.notify(f"Import failed: {exc}", type="negative")
 
             upload = ui.upload(
                 on_upload=handle_upload,
@@ -363,98 +367,110 @@ def _render_contact_lists(state: dict, refresh):
                     "text-slate-500 mt-4"
                 )
             else:
-                columns, rows = read_contact_list(selected)
-                if not columns:
-                    columns = ["Email", "First Name", "Last Name", "Company", "Title"]
+                columns = rows = None
+                try:
+                    columns, rows = read_contact_list(selected)
+                except Exception as exc:
+                    ui.label(f"Could not open '{selected}': {exc}").classes("text-red-500 mt-4")
+                    ui.label("Try re-uploading the file.").classes("text-slate-500 text-sm")
 
-                # Store rows in state for editing
-                state["cl_columns"] = list(columns)
-                # Ensure there's always an empty row at the bottom
-                indexed_rows = [dict(row, _idx=i) for i, row in enumerate(rows)]
-                next_idx = len(indexed_rows)
-                empty_row = {col: "" for col in columns}
-                empty_row["_idx"] = next_idx
-                indexed_rows.append(empty_row)
-                state["cl_rows"] = indexed_rows
+                if columns is not None:
+                    if not columns:
+                        columns = ["Email", "First Name", "Last Name", "Company", "Title"]
 
-                # Action buttons
-                with ui.row().classes("w-full justify-end gap-2 mb-4"):
-                    del_row_btn = ui.button(
-                        "Delete selected rows",
-                        on_click=lambda: _delete_contact_row(state, table, refresh),
+                    # Store rows in state for editing
+                    state["cl_columns"] = list(columns)
+                    # Ensure there's always an empty row at the bottom
+                    indexed_rows = [dict(row, _idx=i) for i, row in enumerate(rows)]
+                    next_idx = len(indexed_rows)
+                    empty_row = {col: "" for col in columns}
+                    empty_row["_idx"] = next_idx
+                    indexed_rows.append(empty_row)
+                    state["cl_rows"] = indexed_rows
+
+                    # Action buttons
+                    with ui.row().classes("w-full justify-end gap-2 mb-4"):
+                        del_row_btn = ui.button(
+                            "Delete selected rows",
+                            on_click=lambda: _delete_contact_row(state, table, refresh),
+                        )
+                        del_row_btn.classes("bg-red-50 text-red-700 border border-red-300")
+                        del_row_btn.props("no-caps")
+
+                        save_btn = ui.button(
+                            "Save changes",
+                            on_click=lambda: _save_contact_list(state, table, refresh),
+                        )
+                        save_btn.classes(
+                            "bg-blue-50 text-blue-700 border-2 border-blue-600 hover:bg-blue-100"
+                        )
+                        save_btn.props("no-caps")
+
+                    # Editable column headers
+                    ui.label("Column Headers").classes("text-xs text-slate-500 mt-1 mb-1")
+                    with ui.row().classes("w-full gap-2 mb-2"):
+                        col_inputs = []
+                        for i, col in enumerate(columns):
+                            inp = ui.input(value=col).props("dense outlined").classes("flex-1")
+                            col_inputs.append(inp)
+                        state["cl_col_inputs"] = col_inputs
+
+                    # Quasar QTable
+                    table_columns = [
+                        {"name": col, "label": col, "field": col, "align": "left", "sortable": True}
+                        for col in columns
+                    ]
+                    table = ui.table(
+                        columns=table_columns,
+                        rows=state["cl_rows"],
+                        row_key="_idx",
+                        selection="multiple",
+                        pagination={"rowsPerPage": 20},
+                    ).classes("w-full")
+                    table.props("flat bordered")
+
+                    # Make each cell editable — emit changes back to Python
+                    for col in columns:
+                        safe_col = col.replace("'", "\\'")
+                        table.add_slot(
+                            f"body-cell-{col}",
+                            f'''
+                            <q-td :props="props">
+                                <q-input v-model="props.row['{safe_col}']" dense borderless
+                                    input-class="text-sm"
+                                    @update:model-value="(val) => $parent.$emit('cell_edit', {{idx: props.row._idx, col: '{safe_col}', value: val}})"
+                                    @blur="$parent.$emit('cell_blur', {{idx: props.row._idx}})" />
+                            </q-td>
+                            '''
+                        )
+
+                    def handle_cell_edit(e):
+                        idx = e.args.get("idx")
+                        col_name = e.args.get("col")
+                        value = e.args.get("value", "")
+                        for row in state["cl_rows"]:
+                            if row.get("_idx") == idx:
+                                row[col_name] = value
+                                break
+
+                    def handle_cell_blur(e):
+                        idx = e.args.get("idx")
+                        last_row = state["cl_rows"][-1] if state["cl_rows"] else None
+                        if last_row and last_row.get("_idx") == idx:
+                            if any(last_row.get(c, "") for c in state["cl_columns"]):
+                                new_idx = max(r.get("_idx", 0) for r in state["cl_rows"]) + 1
+                                new_empty = {c: "" for c in state["cl_columns"]}
+                                new_empty["_idx"] = new_idx
+                                state["cl_rows"].append(new_empty)
+                                table.rows = state["cl_rows"]
+                                table.update()
+
+                    table.on("cell_edit", handle_cell_edit)
+                    table.on("cell_blur", handle_cell_blur)
+
+                    ui.label("Edit cells directly in the table. Click 'Save changes' to persist.").classes(
+                        "text-slate-500 text-sm mt-2"
                     )
-                    del_row_btn.classes("bg-red-50 text-red-700 border border-red-300")
-                    del_row_btn.props("no-caps")
-
-                    save_btn = ui.button(
-                        "Save changes",
-                        on_click=lambda: _save_contact_list(state, table, refresh),
-                    )
-                    save_btn.classes(
-                        "bg-blue-50 text-blue-700 border-2 border-blue-600 hover:bg-blue-100"
-                    )
-                    save_btn.props("no-caps")
-
-                # Editable column headers
-                ui.label("Column Headers").classes("text-xs text-slate-500 mt-1 mb-1")
-                with ui.row().classes("w-full gap-2 mb-2"):
-                    col_inputs = []
-                    for i, col in enumerate(columns):
-                        inp = ui.input(value=col).props("dense outlined").classes("flex-1")
-                        col_inputs.append(inp)
-                    state["cl_col_inputs"] = col_inputs
-
-                # Quasar QTable
-                table_columns = [
-                    {"name": col, "label": col, "field": col, "align": "left", "sortable": True}
-                    for col in columns
-                ]
-                table = ui.table(
-                    columns=table_columns,
-                    rows=state["cl_rows"],
-                    row_key="_idx",
-                    selection="multiple",
-                    pagination={"rowsPerPage": 20},
-                ).classes("w-full")
-                table.props("flat bordered")
-
-                # Make each cell editable — emit changes back to Python
-                for col in columns:
-                    safe_col = col.replace("'", "\\'")
-                    table.add_slot(
-                        f"body-cell-{col}",
-                        f'''
-                        <q-td :props="props">
-                            <q-input v-model="props.row['{safe_col}']" dense borderless
-                                input-class="text-sm"
-                                @update:model-value="(val) => $parent.$emit('cell_edit', {{idx: props.row._idx, col: '{safe_col}', value: val}})" />
-                        </q-td>
-                        '''
-                    )
-
-                def handle_cell_edit(e):
-                    idx = e.args.get("idx")
-                    col_name = e.args.get("col")
-                    value = e.args.get("value", "")
-                    for row in state["cl_rows"]:
-                        if row.get("_idx") == idx:
-                            row[col_name] = value
-                            break
-                    # Auto-add empty row if the last row was edited
-                    last_row = state["cl_rows"][-1] if state["cl_rows"] else None
-                    if last_row and any(last_row.get(c, "") for c in state["cl_columns"]):
-                        new_idx = max(r.get("_idx", 0) for r in state["cl_rows"]) + 1
-                        new_empty = {c: "" for c in state["cl_columns"]}
-                        new_empty["_idx"] = new_idx
-                        state["cl_rows"].append(new_empty)
-                        table.rows = state["cl_rows"]
-                        table.update()
-
-                table.on("cell_edit", handle_cell_edit)
-
-                ui.label("Edit cells directly in the table. Click 'Save changes' to persist.").classes(
-                    "text-slate-500 text-sm mt-2"
-                )
 
 
 def _select_contact_list(state: dict, filename: str, refresh):
