@@ -392,44 +392,143 @@ class OutlookClient:
             items = items.Restrict(f"[Subject] = '{safe_subject}'")
             items.Sort("[SentOn]", True)  # most recent first
 
-            # Find the sent item addressed to this recipient
+            # Find the sent item addressed to this recipient.
+            # Use index-based Recipients access (more reliable than iteration in win32com).
+            # recip.Address may be an Exchange DN for GAL contacts, so also check the
+            # To string by extracting email addresses from angle-bracket notation.
             sent_item = None
             to_lower = to_email.strip().lower()
             for mail in items:
                 try:
                     if mail.Class != 43:  # skip non-mail items
                         continue
-                    if to_lower in (mail.To or "").lower():
+                    matched = False
+                    # Check Recipients collection via index (1-based)
+                    try:
+                        for j in range(1, mail.Recipients.Count + 1):
+                            recip = mail.Recipients.Item(j)
+                            addr = (recip.Address or "").strip().lower()
+                            if addr == to_lower:
+                                matched = True
+                                break
+                    except Exception:
+                        pass
+                    # Fallback: extract bare addresses from the To string
+                    # e.g. "John Doe <john@example.com>; Jane <jane@example.com>"
+                    if not matched:
+                        to_str = (mail.To or "").lower()
+                        addrs_in_to = re.findall(r"<([^>]+)>", to_str)
+                        if not addrs_in_to:
+                            # No angle brackets — treat each semicolon-separated token as an address
+                            addrs_in_to = [a.strip() for a in to_str.split(";")]
+                        if to_lower in addrs_in_to:
+                            matched = True
+                    if matched:
+                        logger.debug("Found sent item for %r: %r", to_email, mail.Subject)
                         sent_item = mail
                         break
+                    else:
+                        logger.debug(
+                            "Skipping sent item (recipient mismatch): To=%r looking for %r",
+                            mail.To, to_email,
+                        )
                 except Exception as item_err:
                     logger.debug("Skipping sent item: %s", item_err)
                     continue
 
             if sent_item is None:
-                logger.warning(
-                    "No sent item found for reply: subject=%r to=%r",
-                    original_subject, to_email,
-                )
+                # Log all candidates that were found (subject matched) to diagnose mismatch
+                try:
+                    debug_items = sent_folder.Items.Restrict(f"[SentOn] >= '{cutoff_str}'")
+                    debug_items = debug_items.Restrict(f"[Subject] = '{safe_subject}'")
+                    candidates = []
+                    for m in debug_items:
+                        try:
+                            if m.Class != 43:
+                                continue
+                            recip_addrs = []
+                            try:
+                                for j in range(1, m.Recipients.Count + 1):
+                                    recip_addrs.append(m.Recipients.Item(j).Address)
+                            except Exception:
+                                pass
+                            candidates.append(f"To={m.To!r} Recipients={recip_addrs}")
+                        except Exception:
+                            pass
+                    logger.warning(
+                        "No sent item found for reply: subject=%r to=%r — "
+                        "candidates with this subject: %s",
+                        original_subject, to_email,
+                        candidates if candidates else "NONE (subject filter matched nothing)",
+                    )
+                except Exception:
+                    logger.warning(
+                        "No sent item found for reply: subject=%r to=%r",
+                        original_subject, to_email,
+                    )
                 return False
 
-            # .Reply() creates a MailItem with In-Reply-To + References set correctly
+            # .Reply() creates a MailItem with In-Reply-To + References set correctly.
+            # On a sent item, Outlook populates Recipients with yourself (the sender);
+            # remove those and add the correct contact.
             reply = sent_item.Reply()
+            for i in range(reply.Recipients.Count, 0, -1):
+                reply.Recipients.Remove(i)
+            reply.Recipients.Add(to_email)
+            if not reply.Recipients.ResolveAll():
+                logger.warning("Could not resolve recipient %r for reply draft", to_email)
 
-            # Inject follow-up content after <body> tag in signature HTML,
-            # same approach as _create_draft_with_sig_real
+            # Extract just the inner body content from signature HTML (full HTML doc).
             sig = signature_html
+            sig_inner = ""
             if sig:
-                body_match = re.search(r"(<body[^>]*>)", sig, re.IGNORECASE)
-                if body_match:
-                    insert_pos = body_match.end()
-                    final_html = sig[:insert_pos] + html_body + sig[insert_pos:]
+                sig_body_start = re.search(r"<body[^>]*>", sig, re.IGNORECASE)
+                sig_body_end = re.search(r"</body>", sig, re.IGNORECASE)
+                if sig_body_start:
+                    end = sig_body_end.start() if sig_body_end else len(sig)
+                    sig_inner = sig[sig_body_start.end():end]
                 else:
-                    final_html = html_body + sig
-            else:
-                final_html = html_body
+                    sig_inner = sig
 
-            reply.HTMLBody = final_html  # replaces Outlook's auto-quoted original body
+            # Build quoted block directly from the original sent item.
+            # reply.HTMLBody from .Reply() does not reliably contain the quoted original
+            # via COM automation (it is only rendered when the inspector opens), so we
+            # construct it ourselves from the sent item's properties.
+            try:
+                sent_date_str = sent_item.SentOn.strftime("%A, %B %d, %Y %I:%M %p")
+            except Exception:
+                sent_date_str = ""
+            sent_from = sent_item.SenderName or sent_item.SenderEmailAddress or ""
+            sent_subj = sent_item.Subject or ""
+            orig_html = sent_item.HTMLBody or ""
+            orig_inner_match = re.search(
+                r"<body[^>]*>(.*?)</body>", orig_html, re.IGNORECASE | re.DOTALL
+            )
+            orig_inner = orig_inner_match.group(1) if orig_inner_match else orig_html
+
+            quoted_block = (
+                f'<hr style="display:inline-block;width:98%" tabindex="-1">'
+                f'<p style="margin:0"><b>From:</b> {sent_from}<br>'
+                f'<b>Sent:</b> {sent_date_str}<br>'
+                f'<b>To:</b> {sent_item.To or ""}<br>'
+                f'<b>Subject:</b> {sent_subj}</p>'
+                f'<div>{orig_inner}</div>'
+            )
+
+            # Assemble final HTML: new content + signature + quoted original.
+            # Use reply.HTMLBody as the outer HTML shell (preserves Outlook's head/styles).
+            existing_body = reply.HTMLBody
+            body_tag = re.search(r"(<body[^>]*>)", existing_body, re.IGNORECASE)
+            if body_tag:
+                insert_pos = body_tag.end()
+                final_html = (existing_body[:insert_pos]
+                              + html_body + sig_inner
+                              + quoted_block
+                              + existing_body[insert_pos:])
+            else:
+                final_html = html_body + sig_inner + quoted_block
+
+            reply.HTMLBody = final_html
             reply.Save()
             reply.Close(1)  # olDiscard — already saved to Drafts
             return True
@@ -457,6 +556,46 @@ class OutlookClient:
             to, subject, len(html_body), cc, bcc, deferred_delivery,
         )
         return True
+
+    # ------------------------------------------------------------------
+    # Sender address resolution
+    # ------------------------------------------------------------------
+
+    def _get_smtp_address(self, mail_item) -> str:
+        """Return the best SMTP sender address for a received mail item.
+
+        mail.SenderEmailAddress is unreliable for internet senders (Gmail,
+        web.de, etc.) in Outlook — it can return an Exchange DN instead of
+        the plain SMTP address. Try multiple properties in order.
+        """
+        # 1. SenderEmailAddress — reliable for plain SMTP/IMAP accounts
+        addr = (mail_item.SenderEmailAddress or "").strip()
+        if addr and "@" in addr:
+            return addr.lower()
+        # 2. AddressEntry.Address — works when Outlook has resolved the sender
+        try:
+            entry = mail_item.Sender
+            if entry:
+                addr2 = (entry.Address or "").strip()
+                if addr2 and "@" in addr2:
+                    return addr2.lower()
+                # Exchange user — fetch primary SMTP via GetExchangeUser()
+                try:
+                    ex_user = entry.GetExchangeUser()
+                    if ex_user:
+                        smtp = (ex_user.PrimarySmtpAddress or "").strip()
+                        if smtp:
+                            return smtp.lower()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # 3. Extract from SenderName "Display Name <email@domain>"
+        name = mail_item.SenderName or ""
+        m = re.search(r"<([^>]+)>", name)
+        if m:
+            return m.group(1).strip().lower()
+        return ""
 
     # ------------------------------------------------------------------
     # Subject normalisation
@@ -556,8 +695,8 @@ class OutlookClient:
                 try:
                     if mail.Class != 43:  # 43 = olMail; skip calendar/task items
                         continue
-                    sender = (mail.SenderEmailAddress or "").strip().lower()
-                    if sender not in email_set:
+                    sender = self._get_smtp_address(mail)
+                    if not sender or sender not in email_set:
                         continue
                     if norm_filters is not None:
                         norm_subj = self._normalize_subject(mail.Subject or "").lower()
