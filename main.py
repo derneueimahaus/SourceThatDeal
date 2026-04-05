@@ -47,6 +47,8 @@ from campaign_engine import (
     guess_email_column,
     guess_column_match,
     create_campaign_drafts,
+    create_followup_drafts,
+    get_non_responders,
 )
 
 if _USE_REAL_OUTLOOK:
@@ -638,6 +640,15 @@ def _render_campaigns(state: dict, refresh):
                         del_btn.classes("text-slate-400 hover:text-red-500")
                         with del_btn:
                             ui.icon("delete").classes("text-xs")
+                        if camp["status"] == "completed":
+                            fu_btn = ui.button(
+                                on_click=lambda f=fname: _open_followup_dialog(f, state, refresh),
+                            )
+                            fu_btn.props("flat round dense size=xs")
+                            fu_btn.tooltip("Send follow-up")
+                            fu_btn.classes("text-blue-400 hover:text-blue-600")
+                            with fu_btn:
+                                ui.icon("reply_all").classes("text-xs")
 
         # ---- Right panel: wizard ----
         with ui.column().classes("flex-1 min-w-0 flex flex-col pl-4"):
@@ -718,6 +729,319 @@ def _confirm_delete_campaign(filename: str, state: dict, refresh):
                 "bg-red-600 text-white"
             ).props("no-caps")
     dlg.open()
+
+
+def _open_followup_dialog(campaign_filename: str, state: dict, refresh):
+    """Open the follow-up dialog for a completed campaign.
+
+    Three sequential phases:
+      1. User sets lookback window and triggers inbox scan.
+      2. Editable table of non-responders (select rows to remove).
+      3. Pick a follow-up template, then create threaded reply drafts.
+    """
+    campaign = read_campaign(campaign_filename)
+    if not campaign:
+        ui.notify("Campaign not found.", type="negative")
+        return
+
+    contact_list = campaign.get("contact_list", "")
+    email_column = campaign.get("email_column", "")
+    subject_template = campaign.get("subject_template", "")
+    field_mapping = campaign.get("field_mapping", {})
+
+    if not contact_list or not email_column:
+        ui.notify("Campaign has no contact list configured.", type="warning")
+        return
+
+    try:
+        columns, all_rows = read_contact_list(contact_list)
+    except Exception as e:
+        ui.notify(f"Cannot read contact list: {e}", type="negative")
+        return
+
+    # Shared mutable state for the dialog
+    dlg_state = {
+        "rows": list(all_rows),  # replaced after scan with non-responders only
+        "scan_result": {"done": False, "replied": set(), "error": None},
+    }
+
+    with ui.dialog().props("maximized persistent") as dlg, ui.card().classes(
+        "w-full max-w-4xl p-6 mx-auto"
+    ):
+        with ui.row().classes("w-full items-center justify-between mb-4"):
+            ui.label(f"Follow-up: {campaign.get('name', '')}").classes(
+                "text-xl font-semibold"
+            )
+            with ui.button(on_click=dlg.close).props("flat round dense").classes(
+                "text-slate-400"
+            ):
+                ui.icon("close")
+
+        # ── Phase 1: Scan controls ────────────────────────────────────────
+        ui.label("Step 1 — Scan inbox for replies").classes(
+            "text-base font-semibold text-slate-700 mb-1"
+        )
+        ui.label(
+            f"Scans your Outlook inbox for replies from the {len(all_rows)} "
+            "contacts in the original campaign."
+        ).classes("text-sm text-slate-500 mb-3")
+
+        with ui.row().classes("items-center gap-4 mb-3"):
+            lookback_input = ui.number(
+                "Lookback (days)", value=14, min=1, max=365, step=1,
+            ).props("outlined dense").classes("w-40")
+            ui.label("Only emails received within this window are scanned.").classes(
+                "text-xs text-slate-400"
+            )
+
+        scan_status_label = ui.label("").classes("text-sm text-slate-500 mb-1")
+        scan_progress_bar = ui.linear_progress(value=0, show_value=False).classes("w-full mb-2")
+        scan_progress_bar.set_visibility(False)
+
+        # ── Phase 2: Non-responder table (hidden until scan completes) ────
+        config_panel = ui.column().classes("w-full")
+        config_panel.set_visibility(False)
+
+        # Refs for Phase 3 inputs (created inside config_panel below)
+        followup_refs = {"template_select": None}
+
+        def _build_results_ui():
+            config_panel.clear()
+            with config_panel:
+                ui.separator().classes("my-4")
+                ui.label("Step 2 — Review non-responders").classes(
+                    "text-base font-semibold text-slate-700 mb-1"
+                )
+                n_replied = len(all_rows) - len(dlg_state["rows"])
+                ui.label(
+                    f"{n_replied} contact(s) replied and are excluded. "
+                    f"{len(dlg_state['rows'])} will receive a follow-up. "
+                    "Select rows and click Remove to exclude more."
+                ).classes("text-sm text-slate-500 mb-2")
+
+                if dlg_state["rows"]:
+                    table_cols = [
+                        {"name": c, "label": c, "field": c, "align": "left"}
+                        for c in columns
+                    ]
+                    nr_table = ui.table(
+                        columns=table_cols,
+                        rows=dlg_state["rows"],
+                        row_key=email_column,
+                        selection="multiple",
+                        pagination={"rowsPerPage": 10},
+                    ).classes("w-full")
+                    nr_table.props("flat bordered dense")
+
+                    def remove_selected():
+                        selected_keys = {
+                            r.get(email_column, "").lower()
+                            for r in nr_table.selected
+                        }
+                        dlg_state["rows"] = [
+                            r for r in dlg_state["rows"]
+                            if r.get(email_column, "").lower() not in selected_keys
+                        ]
+                        nr_table.rows = dlg_state["rows"]
+                        nr_table.selected = []
+                        nr_table.update()
+
+                    ui.button("Remove selected", on_click=remove_selected).props(
+                        "flat no-caps"
+                    ).classes("text-red-600 mt-1 mb-2")
+                else:
+                    ui.label("All contacts have replied — nothing to follow up on.").classes(
+                        "text-green-600 font-medium mb-2"
+                    )
+
+                # ── Phase 3: Template + draft creation ───────────────────
+                ui.separator().classes("my-4")
+                ui.label("Step 3 — Create follow-up drafts").classes(
+                    "text-base font-semibold text-slate-700 mb-2"
+                )
+                templates = list_templates()
+
+                fu_template_select = ui.select(
+                    options=templates,
+                    value=None,
+                    label="Follow-up template",
+                ).props("outlined").classes("w-80")
+                followup_refs["template_select"] = fu_template_select
+                ui.label(
+                    "Subject is taken from the original email — the reply will thread correctly."
+                ).classes("text-xs text-slate-400 mb-3")
+
+                fu_progress_label = ui.label("").classes("text-sm text-slate-500 mt-1")
+                fu_progress_bar = ui.linear_progress(value=0, show_value=False).classes("w-full")
+                fu_progress_bar.set_visibility(False)
+
+                with ui.row().classes("gap-3 mt-3"):
+                    ui.button("Cancel", on_click=dlg.close).props("flat no-caps")
+                    ui.button(
+                        "Create follow-up drafts",
+                        on_click=lambda: _run_followup_drafts(
+                            dlg_state, campaign, followup_refs,
+                            fu_progress_label, fu_progress_bar, dlg,
+                        ),
+                    ).classes("bg-blue-600 text-white").props("no-caps")
+
+        # ── Scan trigger button ───────────────────────────────────────────
+        async def _do_scan():
+            days = int(lookback_input.value or 14)
+            scan_progress_bar.set_visibility(True)
+            scan_status_label.set_text(f"Scanning last {days} days of inbox…")
+            config_panel.set_visibility(False)
+
+            email_list = [
+                row.get(email_column, "").strip()
+                for row in all_rows
+                if row.get(email_column, "").strip()
+            ]
+
+            # Build per-contact merged subjects for precise matching (deduplicated)
+            subject_filters = list({
+                merge_subject(subject_template, row, field_mapping)
+                for row in all_rows
+                if merge_subject(subject_template, row, field_mapping)
+            })
+
+            scan_state = dlg_state["scan_result"]
+            scan_state["done"] = False
+            scan_state["replied"] = set()
+            scan_state["error"] = None
+
+            def do_scan_work():
+                if _USE_REAL_OUTLOOK:
+                    pythoncom.CoInitialize()
+                try:
+                    client = OutlookClient()
+                    replies = client.scan_for_replies(
+                        email_list,
+                        max_items=500,
+                        subject_filters=subject_filters,
+                        lookback_days=days,
+                    )
+                    scan_state["replied"] = {r["sender_email"].lower() for r in replies}
+                except Exception as e:
+                    scan_state["error"] = str(e)
+                finally:
+                    scan_state["done"] = True
+                    if _USE_REAL_OUTLOOK:
+                        pythoncom.CoUninitialize()
+
+            def poll_scan():
+                if scan_state["done"]:
+                    scan_timer.deactivate()
+                    scan_progress_bar.set_visibility(False)
+                    if scan_state["error"]:
+                        ui.notify(f"Scan error: {scan_state['error']}", type="negative")
+                        scan_status_label.set_text("Scan failed — see error notification.")
+                        return
+                    replied = scan_state["replied"]
+                    dlg_state["rows"] = get_non_responders(campaign, all_rows, replied)
+                    n_replied = len(all_rows) - len(dlg_state["rows"])
+                    scan_status_label.set_text(
+                        f"Scan complete ({days}-day window): "
+                        f"{n_replied} replied, {len(dlg_state['rows'])} to follow up."
+                    )
+                    _build_results_ui()
+                    config_panel.set_visibility(True)
+
+            scan_timer = ui.timer(0.3, poll_scan)
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, do_scan_work)
+
+        ui.button("Scan inbox for replies", on_click=_do_scan).classes(
+            "bg-blue-600 text-white"
+        ).props("no-caps")
+
+        with config_panel:
+            pass  # populated by _build_results_ui() after scan
+
+    dlg.open()
+
+
+async def _run_followup_drafts(
+    dlg_state: dict,
+    campaign: dict,
+    followup_refs: dict,
+    progress_label,
+    progress_bar,
+    dlg,
+):
+    """Create follow-up drafts for non-responders. Mirrors _run_campaign_drafts."""
+    template_id = followup_refs["template_select"].value if followup_refs["template_select"] else ""
+    email_column = campaign.get("email_column", "")
+    field_mapping = campaign.get("field_mapping", {})
+    original_subject_template = campaign.get("subject_template", "")
+    rows = dlg_state.get("rows", [])
+
+    if not template_id:
+        ui.notify("Select a follow-up template.", type="warning")
+        return
+    if not rows:
+        ui.notify("No contacts to send follow-up to.", type="warning")
+        return
+
+    html = read_template(template_id)
+    total = len(rows)
+    progress_state = {"current": 0, "done": False, "success": 0, "errors": []}
+
+    progress_bar.set_visibility(True)
+    progress_label.set_text(f"Creating follow-up drafts… 0/{total}")
+
+    def do_creation():
+        if _USE_REAL_OUTLOOK:
+            pythoncom.CoInitialize()
+        try:
+            client = OutlookClient()
+            sig = client.get_default_signature_html()
+
+            def on_progress(current, tot):
+                progress_state["current"] = current
+
+            success, errors = create_followup_drafts(
+                outlook=client,
+                template_html=html,
+                original_subject_template=original_subject_template,
+                rows=rows,
+                field_mapping=field_mapping,
+                email_column=email_column,
+                signature_html=sig,
+                sent_lookback_days=180,
+                on_progress=on_progress,
+            )
+            progress_state["success"] = success
+            progress_state["errors"] = errors
+        finally:
+            progress_state["done"] = True
+            if _USE_REAL_OUTLOOK:
+                pythoncom.CoUninitialize()
+
+    def poll_progress():
+        cur = progress_state["current"]
+        if total > 0:
+            progress_bar.set_value(cur / total)
+            progress_label.set_text(f"Creating follow-up drafts… {cur}/{total}")
+        if progress_state["done"]:
+            timer.deactivate()
+            progress_bar.set_visibility(False)
+            s = progress_state["success"]
+            errs = progress_state["errors"]
+            if errs:
+                ui.notify(
+                    f"{s} follow-up draft(s) created, {len(errs)} error(s).",
+                    type="warning",
+                )
+            else:
+                ui.notify(f"All {s} follow-up draft(s) created!", type="positive")
+            progress_label.set_text(f"Done: {s}/{total} drafts created.")
+            if not errs:
+                dlg.close()
+
+    timer = ui.timer(0.3, poll_progress)
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, do_creation)
 
 
 def _render_campaign_wizard(state: dict, campaign: dict, refresh):

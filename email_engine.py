@@ -6,7 +6,7 @@ Provides OutlookClient with real Outlook (Windows/win32com) or mock (Linux) back
 import logging
 import platform
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -30,6 +30,9 @@ if _IS_WINDOWS:
 
 # Use real Outlook only when we have win32com on Windows
 _USE_REAL_OUTLOOK = _IS_WINDOWS and _win32com is not None
+
+# Reply/forward subject prefixes stripped during subject normalisation (multilingual)
+_REPLY_PREFIXES = re.compile(r"^\s*(re|aw|fwd?|sv|vs|wg)\s*:\s*", re.IGNORECASE)
 
 
 class OutlookClient:
@@ -332,6 +335,118 @@ class OutlookClient:
             logger.exception("Failed to create draft with signature: %s", e)
             return False
 
+    # ------------------------------------------------------------------
+    # Threaded reply draft (for follow-up campaigns)
+    # ------------------------------------------------------------------
+
+    def create_reply_draft(
+        self,
+        original_subject: str,
+        to_email: str,
+        html_body: str,
+        *,
+        signature_html: str = "",
+        sent_lookback_days: int = 180,
+    ) -> bool:
+        """
+        Find the original sent email for this contact and create a threaded reply draft.
+
+        Locates the sent item by subject + recipient in the Sent Items folder, calls
+        .Reply() on it so Outlook sets In-Reply-To and References automatically, then
+        replaces the body with the follow-up template content and saves to Drafts.
+
+        Args:
+            original_subject: The exact subject that was sent to this contact (merged).
+            to_email: Recipient email address (used to identify the correct sent item).
+            html_body: Follow-up template HTML (already merged with contact data).
+            signature_html: Cached signature HTML to inject, same as other draft methods.
+            sent_lookback_days: How far back to search Sent Items (default 180 days).
+
+        Returns:
+            True if reply draft was saved; False if sent item not found or on error.
+        """
+        if _USE_REAL_OUTLOOK:
+            return self._create_reply_draft_real(
+                original_subject, to_email, html_body,
+                signature_html=signature_html,
+                sent_lookback_days=sent_lookback_days,
+            )
+        return self._create_reply_draft_mock(original_subject, to_email, html_body)
+
+    def _create_reply_draft_real(
+        self, original_subject, to_email, html_body,
+        *, signature_html="", sent_lookback_days=180,
+    ) -> bool:
+        if not self._ensure_outlook():
+            return False
+        try:
+            sent_folder = self._namespace.GetDefaultFolder(5)  # 5 = olFolderSentMail
+
+            # Chain two Restrict() calls — more reliable than AND in a single Jet filter.
+            # Use 12-hour clock (%I + %p) to avoid the %H/%p mixing bug.
+            cutoff = datetime.now() - timedelta(days=sent_lookback_days)
+            cutoff_str = cutoff.strftime("%m/%d/%Y %I:%M %p")
+            items = sent_folder.Items.Restrict(f"[SentOn] >= '{cutoff_str}'")
+            # Escape single quotes in subject for Jet filter
+            safe_subject = original_subject.replace("'", "''")
+            items = items.Restrict(f"[Subject] = '{safe_subject}'")
+            items.Sort("[SentOn]", True)  # most recent first
+
+            # Find the sent item addressed to this recipient
+            sent_item = None
+            to_lower = to_email.strip().lower()
+            for mail in items:
+                try:
+                    if mail.Class != 43:  # skip non-mail items
+                        continue
+                    if to_lower in (mail.To or "").lower():
+                        sent_item = mail
+                        break
+                except Exception as item_err:
+                    logger.debug("Skipping sent item: %s", item_err)
+                    continue
+
+            if sent_item is None:
+                logger.warning(
+                    "No sent item found for reply: subject=%r to=%r",
+                    original_subject, to_email,
+                )
+                return False
+
+            # .Reply() creates a MailItem with In-Reply-To + References set correctly
+            reply = sent_item.Reply()
+
+            # Inject follow-up content after <body> tag in signature HTML,
+            # same approach as _create_draft_with_sig_real
+            sig = signature_html
+            if sig:
+                body_match = re.search(r"(<body[^>]*>)", sig, re.IGNORECASE)
+                if body_match:
+                    insert_pos = body_match.end()
+                    final_html = sig[:insert_pos] + html_body + sig[insert_pos:]
+                else:
+                    final_html = html_body + sig
+            else:
+                final_html = html_body
+
+            reply.HTMLBody = final_html  # replaces Outlook's auto-quoted original body
+            reply.Save()
+            reply.Close(1)  # olDiscard — already saved to Drafts
+            return True
+
+        except Exception as e:
+            logger.exception("Failed to create reply draft: %s", e)
+            return False
+
+    def _create_reply_draft_mock(
+        self, original_subject, to_email, html_body,
+    ) -> bool:
+        logger.info(
+            "[MOCK] create_reply_draft to=%r original_subject=%r html_len=%d",
+            to_email, original_subject, len(html_body),
+        )
+        return True
+
     def _create_draft_with_sig_mock(
         self, to, subject, html_body, *, cc=None, bcc=None,
         deferred_delivery=None,
@@ -344,6 +459,23 @@ class OutlookClient:
         return True
 
     # ------------------------------------------------------------------
+    # Subject normalisation
+    # ------------------------------------------------------------------
+
+    def _normalize_subject(self, subject: str) -> str:
+        """Strip all leading reply/forward prefixes (Re:, AW:, FW:, SV:, WG:, VS:).
+
+        Loops until no more prefixes remain so chained replies like
+        "Re: Re: Intro" are fully unwrapped.
+        """
+        s = subject or ""
+        while True:
+            stripped = _REPLY_PREFIXES.sub("", s)
+            if stripped == s:
+                return s.strip()
+            s = stripped
+
+    # ------------------------------------------------------------------
     # Reply scanning
     # ------------------------------------------------------------------
 
@@ -353,6 +485,8 @@ class OutlookClient:
         *,
         folder_name: str = "Inbox",
         max_items: int = 500,
+        subject_filters: list[str] | None = None,
+        lookback_days: int = 14,
     ) -> list[dict]:
         """
         Scan the local Inbox (or named folder) for replies from the given addresses.
@@ -360,7 +494,13 @@ class OutlookClient:
         Args:
             email_list: List of sender email addresses to look for (case-insensitive).
             folder_name: Outlook folder to scan (default "Inbox").
-            max_items: Maximum number of items to scan (default 500).
+            max_items: Maximum number of items to scan within the lookback window.
+            subject_filters: Optional list of original (bare) subject strings. When
+                provided, an inbox item must match both a sender address AND contain
+                one of the normalised subjects as a substring.
+            lookback_days: Only scan items received within this many days (default 14).
+                Uses Items.Restrict() so filtering is done by the Outlook data store,
+                not in Python — much faster for large inboxes.
 
         Returns:
             List of dicts with keys: sender_email, subject, received_time, entry_id.
@@ -370,33 +510,89 @@ class OutlookClient:
             return []
         normalized = {addr.strip().lower() for addr in email_list if addr}
         if _USE_REAL_OUTLOOK:
-            return self._scan_for_replies_real(normalized, folder_name, max_items)
-        return self._scan_for_replies_mock(normalized, folder_name, max_items)
+            return self._scan_for_replies_real(
+                normalized, folder_name, max_items,
+                subject_filters=subject_filters, lookback_days=lookback_days,
+            )
+        return self._scan_for_replies_mock(
+            normalized, folder_name, max_items,
+            subject_filters=subject_filters, lookback_days=lookback_days,
+        )
 
     def _scan_for_replies_real(
         self,
         email_set: set[str],
         folder_name: str,
         max_items: int,
+        *,
+        subject_filters: list[str] | None = None,
+        lookback_days: int = 14,
     ) -> list[dict]:
-        """Scan for replies is disabled; returns empty list.
+        if not self._ensure_outlook():
+            return []
+        try:
+            inbox = self._namespace.GetDefaultFolder(6)  # 6 = olFolderInbox
 
-        This feature will be re-implemented later.
-        """
-        logger.info("scan_for_replies is disabled; returning empty list.")
-        return []
+            # Restrict() delegates date filtering to the Outlook/MAPI data store so
+            # only items within the lookback window are iterated — far faster than
+            # loading all items and comparing dates in Python.
+            # Use 12-hour clock (%I) + AM/PM (%p); mixing 24-hour %H with %p is invalid.
+            cutoff = datetime.now() - timedelta(days=lookback_days)
+            cutoff_str = cutoff.strftime("%m/%d/%Y %I:%M %p")
+            items = inbox.Items.Restrict(f"[ReceivedTime] >= '{cutoff_str}'")
+            items.Sort("[ReceivedTime]", True)  # newest first
+
+            norm_filters = (
+                [sf.lower() for sf in subject_filters if sf]
+                if subject_filters else None
+            )
+
+            results = []
+            count = 0
+            for mail in items:
+                if count >= max_items:
+                    break
+                count += 1
+                try:
+                    if mail.Class != 43:  # 43 = olMail; skip calendar/task items
+                        continue
+                    sender = (mail.SenderEmailAddress or "").strip().lower()
+                    if sender not in email_set:
+                        continue
+                    if norm_filters is not None:
+                        norm_subj = self._normalize_subject(mail.Subject or "").lower()
+                        if not any(f in norm_subj for f in norm_filters):
+                            continue
+                    results.append({
+                        "sender_email": sender,
+                        "subject": mail.Subject or "",
+                        "received_time": str(mail.ReceivedTime),
+                        "entry_id": mail.EntryID,
+                    })
+                except Exception as item_err:
+                    logger.debug("Skipping inbox item: %s", item_err)
+            return results
+        except Exception as e:
+            logger.exception("scan_for_replies error: %s", e)
+            return []
 
     def _scan_for_replies_mock(
         self,
         email_set: set[str],
         folder_name: str,
         max_items: int,
+        *,
+        subject_filters: list[str] | None = None,
+        lookback_days: int = 14,
     ) -> list[dict]:
         logger.info(
-            "[MOCK] scan_for_replies email_list=%s folder=%s max_items=%s",
+            "[MOCK] scan_for_replies email_list=%s folder=%s max_items=%s "
+            "subject_filters=%s lookback_days=%s",
             list(email_set),
             folder_name,
             max_items,
+            subject_filters,
+            lookback_days,
         )
         return []
 
